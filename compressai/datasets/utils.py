@@ -16,7 +16,9 @@ from pathlib import Path
 
 from PIL import Image
 from torch.utils.data import Dataset
-
+import glob
+import os
+import datetime
 
 class ImageFolder(Dataset):
     """Load an image folder database. Training and testing image samples
@@ -44,8 +46,11 @@ class ImageFolder(Dataset):
 
         if not splitdir.is_dir():
             raise RuntimeError(f'Invalid directory "{root}"')
+        
+        self.samples = glob.glob(os.path.join(splitdir, '*.jpg'))
+        self.samples += glob.glob(os.path.join(splitdir, '*.png'))
 
-        self.samples = [f for f in splitdir.iterdir() if f.is_file()]
+        # self.samples = [f for f in splitdir.iterdir() if f.is_file()]
 
         self.transform = transform
 
@@ -64,3 +69,25 @@ class ImageFolder(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+def makedirs(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+
+def setup_generic_signature(special_info):
+    time_signature = '{:%Y_%m_%d_%H:%M}'.format(datetime.datetime.now()).replace(':', '_')
+    name = '{}_{}'.format(special_info, time_signature)
+    root = os.path.join("../experiment",name)
+    checkpoints_save = os.path.join(root,"checkpoints")
+    figures_save = os.path.join(root, 'figures')
+    tensorboard_runs = os.path.join(root, 'tensorboard')
+    
+    makedirs(checkpoints_save)
+    makedirs(figures_save)
+    makedirs(tensorboard_runs)
+
+    return {"checkpoints_save": checkpoints_save,
+        "figures_save":figures_save,
+        "tensorboard_runs": tensorboard_runs
+    }

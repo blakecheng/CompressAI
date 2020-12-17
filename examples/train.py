@@ -29,6 +29,13 @@ from compressai.datasets import ImageFolder
 from compressai.layers import GDN
 from compressai.models import CompressionModel
 from compressai.models.utils import conv, deconv
+from torch.utils.tensorboard import SummaryWriter
+from compressai.utils import setup_generic_signature
+from torch.utils.tensorboard import SummaryWriter
+from compressai.zoo import (bmshj2018_factorized, bmshj2018_hyperprior, mbt2018_mean, mbt2018, cheng2020_anchor)
+from tqdm import tqdm 
+import os
+import logging
 
 
 class AutoEncoder(CompressionModel):
@@ -63,6 +70,9 @@ class AutoEncoder(CompressionModel):
                 "y": y_likelihoods,
             },
         }
+
+
+
 
 
 class RateDistortionLoss(nn.Module):
@@ -104,13 +114,32 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm
+class Logger:
+    def __init__(self,log_interval=10,test_inteval=100,save_dirs=None,max_iter=1e6):
+        self.iteration = 0
+        self.log_interval = log_interval
+        self.test_inteval = test_inteval
+        self.best_loss = 1000
+        self.save_dirs = save_dirs
+        self.max_iter = int(max_iter)
+
+
+    def updata(self):
+        self.iteration+=1
+        if self.iteration%self.log_interval==1:
+            return True
+        return False
+    
+
+
+
+def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm,test_dataloader,args,writer=None,test_writer=None,logger=None
 ):
     model.train()
     device = next(model.parameters()).device
 
-    for i, d in enumerate(train_dataloader):
+    pbar = tqdm(train_dataloader,ncols=160)
+    for i, d in enumerate(pbar):
         d = d.to(device)
 
         optimizer.zero_grad()
@@ -128,19 +157,44 @@ def train_one_epoch(
         aux_loss.backward()
         aux_optimizer.step()
 
-        if i % 10 == 0:
-            print(
-                f"Train epoch {epoch}: ["
-                f"{i*len(d)}/{len(train_dataloader.dataset)}"
-                f" ({100. * i / len(train_dataloader):.0f}%)]"
-                f'\tLoss: {out_criterion["loss"].item():.3f} |'
-                f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
-                f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-                f"\tAux loss: {aux_loss.item():.2f}"
+        if logger.updata():
+            if writer is not None:
+                step = logger.iteration
+                writer.add_scalar("mse_loss",out_criterion["mse_loss"], step)
+                writer.add_scalar("bpp_loss",out_criterion["bpp_loss"], step)
+                writer.add_scalar("loss",out_criterion["loss"], step)
+                writer.add_images('gen_recon', torch.cat((out_net["x_hat"][:4],d[:4]),dim=0), step)
+
+            
+        pbar.set_description(
+        "Train epoch {}: Loss: {:.3f} | MSE loss:{:.3f} | Bpp loss: {:.2f} | Aux loss: {:.2f}".format(epoch,
+            out_criterion["loss"].item(),
+            out_criterion["mse_loss"].item(),
+            out_criterion["bpp_loss"].item(),
+            aux_loss.item()
+        )
+        )
+        pbar.set_postfix(iterations="{}/{}".format(logger.iteration,logger.max_iter))
+
+        if logger.iteration%logger.test_inteval==1:
+            loss = test(logger.iteration, test_dataloader, model, criterion,test_writer=test_writer,logger=logger)
+            is_best = loss < logger.best_loss
+            logger.best_loss = min(loss, logger.best_loss)
+            save_checkpoint(
+                {
+                    "epoch": epoch + 1,
+                    "state_dict": model.state_dict(),
+                    "loss": loss,
+                    "optimizer": optimizer.state_dict(),
+                    "aux_optimizer": aux_optimizer.state_dict(),
+                    "args":args
+                },
+                is_best, path= logger.save_dirs["checkpoints_save"]
             )
 
 
-def test_epoch(epoch, test_dataloader, model, criterion):
+
+def test(iterations, test_dataloader, model, criterion,test_writer=None,logger=None):
     model.eval()
     device = next(model.parameters()).device
 
@@ -160,22 +214,35 @@ def test_epoch(epoch, test_dataloader, model, criterion):
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
 
+    if test_writer is not None:
+        step = logger.iteration
+        test_writer.add_scalar("mse_loss",mse_loss.avg, step)
+        test_writer.add_scalar("bpp_loss",bpp_loss.avg, step)
+        test_writer.add_scalar("loss",loss.avg, step)
+        test_writer.add_images('gen_recon', torch.cat((out_net["x_hat"][:4],d[:4]),dim=0), step) 
+    
     print(
-        f"Test epoch {epoch}: Average losses:"
+        f"\niterations {iterations}: Average losses:"
         f"\tLoss: {loss.avg:.3f} |"
         f"\tMSE loss: {mse_loss.avg:.3f} |"
         f"\tBpp loss: {bpp_loss.avg:.2f} |"
         f"\tAux loss: {aux_loss.avg:.2f}\n"
     )
 
+
     return loss.avg
 
 
-def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
+def save_checkpoint(state, is_best, path):
+    filename=os.path.join(path,"checkpoint.pth.tar")
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, "checkpoint_best_loss.pth.tar")
+        shutil.copyfile(filename, os.path.join(path,"checkpoint_best_loss.pth.tar"))
 
+def prepare_save(model="defualt",dataset="openimage",quality=1):
+    special_info = "{}_{}_q{}".format(model,dataset,quality)
+    save_dirs = setup_generic_signature(special_info)
+    return save_dirs
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Example training script")
@@ -185,13 +252,29 @@ def parse_args(argv):
         '--dataset',
         type=str,
         required=True,
-        help='Training dataset')
+        help='Training dataset path')
+    parser.add_argument(
+        '--dataname',
+        type=str,
+        default="openimage",
+        help='Training dataset name')
+    parser.add_argument(
+        '--model',
+        type=str,
+        default = "AE",
+        help='Training model')
     parser.add_argument(
         '-e',
         '--epochs',
         default=100,
         type=int,
         help='Number of epochs (default: %(default)s)')
+    parser.add_argument(
+        '-i',
+        '--iterations',
+        default=1e6,
+        type=int,
+        help='Number of iterations (default: %(default)s)')
     parser.add_argument(
         '-lr',
         '--learning-rate',
@@ -221,6 +304,11 @@ def parse_args(argv):
         default=64,
         help='Test batch size (default: %(default)s)')
     parser.add_argument(
+        '--quality',
+        type=int,
+        default=1,
+        help='quality (default: 1')
+    parser.add_argument(
         '--aux-learning-rate',
         default=1e-3,
         help='Auxiliary loss learning rate (default: %(default)s)')
@@ -242,18 +330,30 @@ def parse_args(argv):
         '--seed',
         type=float,
         help='Set random seed for reproducibility')
+    
+    
     parser.add_argument('--clip_max_norm',
                         default=0.1,
                         type=float,
                         help='gradient clipping max norm')
+    
+        
+    
     # yapf: enable
     args = parser.parse_args(argv)
     return args
 
 
+
+
 def main(argv):
     args = parse_args(argv)
-
+    
+    save_dirs = prepare_save(model=args.model,dataset=args.dataname,quality=args.quality)
+    logger = Logger(save_dirs=save_dirs)
+    train_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"train"))
+    test_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"test"))
+    
     if args.seed is not None:
         torch.manual_seed(args.seed)
         random.seed(args.seed)
@@ -285,8 +385,22 @@ def main(argv):
         pin_memory=True,
     )
 
-    device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-    net = AutoEncoder()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if args.model == "AE":
+        net = AutoEncoder()
+    elif  args.model == "bmshj2018_factorized":
+        net = bmshj2018_factorized(quality=args.quality)
+    elif  args.model == "bmshj2018_hyperprior":
+        net = bmshj2018_hyperprior(quality=args.quality)
+    elif  args.model == "mbt2018_mean":
+        net = mbt2018_mean(quality=args.quality)
+    elif  args.model == "mbt2018":
+        net = mbt2018(quality=args.quality)
+    elif  args.model == "cheng2020_anchor":
+        net = cheng2020_anchor(quality=args.quality)
+
+    
     net = net.to(device)
     optimizer = optim.Adam(net.parameters(), lr=args.learning_rate)
     aux_optimizer = optim.Adam(net.aux_parameters(), lr=args.aux_learning_rate)
@@ -302,23 +416,14 @@ def main(argv):
             aux_optimizer,
             epoch,
             args.clip_max_norm,
+            test_dataloader,
+            args,
+            writer=train_writer,
+            test_writer=test_writer,
+            logger=logger
         )
 
-        loss = test_epoch(epoch, test_dataloader, net, criterion)
-
-        is_best = loss < best_loss
-        best_loss = min(loss, best_loss)
-        if args.save:
-            save_checkpoint(
-                {
-                    "epoch": epoch + 1,
-                    "state_dict": net.state_dict(),
-                    "loss": loss,
-                    "optimizer": optimizer.state_dict(),
-                    "aux_optimizer": aux_optimizer.state_dict(),
-                },
-                is_best,
-            )
+       
 
 
 if __name__ == "__main__":
