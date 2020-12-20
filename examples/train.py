@@ -191,6 +191,8 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
                 },
                 is_best, path= logger.save_dirs["checkpoints_save"]
             )
+        
+    test(logger.iteration, test_dataloader, model, criterion,test_writer=test_writer,logger=logger)
 
 
 
@@ -350,7 +352,7 @@ def main(argv):
     args = parse_args(argv)
     
     save_dirs = prepare_save(model=args.model,dataset=args.dataname,quality=args.quality)
-    logger = Logger(save_dirs=save_dirs)
+    logger = Logger(log_interval=100,test_inteval=1000,save_dirs=save_dirs)
     train_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"train"))
     test_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"test"))
     

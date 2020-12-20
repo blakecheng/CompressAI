@@ -26,7 +26,7 @@ err_report() {
 }
 trap 'err_report $LINENO' ERR
 
-NJOBS=30
+NJOBS=8
 
 usage() {
     echo "usage: $(basename $0) dataset CODECS"
@@ -54,7 +54,7 @@ BPGDEC="$(which bpgdec)"
 # Tensorflow Compression script
 # https://github.com/tensorflow/compression
 # edit path below or uncomment locate function
-# TFCI_SCRIPT="${HOME}/tensorflow-compression/compression/models/tfci.py"
+TFCI_SCRIPT="${HOME}/compression/models/tfci.py"
 
 # VTM
 # edit below to provide the path to the chosen version of VTM
@@ -80,7 +80,7 @@ AV1_BIN_DIR="${HOME}/av1/aom/build_gcc"
 
 jpeg() {
     python3 -m compressai.utils.bench jpeg "$dataset"            \
-        -q $(seq 5 5 95) -j "$NJOBS" > benchmarks/jpeg.json
+        -q $(seq 5 5 95) -j "$NJOBS" > "benchmarks/$1"
 }
 
 jpeg2000() {
@@ -137,7 +137,8 @@ mkdir -p "benchmarks"
 for i in "$@"; do
     case $i in
         "jpeg")
-            jpeg
+            mkdir -p "benchmarks/jpeg"
+            jpeg $2_jpeg.json
             ;;
         "jpeg2000")
             jpeg2000
@@ -149,7 +150,8 @@ for i in "$@"; do
             # bpg "420" "x265" "rgb" bpg_420_x265_rgb.json
             # bpg "420" "x265" "ycbcr" bpg_420_x265_ycbcr.json
             # bpg "444" "x265" "rgb" bpg_444_x265_rgb.json
-            bpg "444" "x265" "ycbcr" bpg_444_x265_ycbcr.json
+            mkdir -p "benchmarks/bgp"
+            bpg "444" "x265" "ycbcr" $2_bpg_444_x265_ycbcr.json
 
             # bpg "420" "jctvc" "rgb" bpg_420_jctvc_rgb.json
             # bpg "420" "jctvc" "ycbcr" bpg_420_jctvc_ycbcr.json
