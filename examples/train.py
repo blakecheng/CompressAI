@@ -129,7 +129,31 @@ class Logger:
         if self.iteration%self.log_interval==1:
             return True
         return False
+
+# class PSNR(nn.Module):
+#     def __init__(self, max_val):
+#         super(PSNR, self).__init__()
+
+#         base10 = torch.log(torch.tensor(10.0))
+#         max_val = torch.tensor(max_val).float()
+
+#         self.register_buffer('base10', base10)
+#         self.register_buffer('max_val', 20 * torch.log(max_val) / base10)
+
+#     def __call__(self, a, b):
+#         mse = torch.mean((a.float() - b.float()) ** 2)
     
+#         if mse == 0:
+#             return 0
+
+#         return self.max_val - 10 * torch.log(mse) / self.base10
+
+def compute_psnr(a,b,max_val=torch.tensor(255.0)):
+    mse = torch.mean((a.float() - b.float()) ** 2)
+    if mse == 0:
+        mse=torch.tensor([1e-6]).cuda()
+    
+    return (20 * torch.log(max_val) - 10 * torch.log(mse))/torch.log(torch.tensor(10.0))
 
 
 
@@ -206,17 +230,19 @@ def test(iterations, test_dataloader, model, criterion,test_writer=None,logger=N
     bpp_loss = AverageMeter()
     mse_loss = AverageMeter()
     aux_loss = AverageMeter()
+    psnr = AverageMeter()
 
     with torch.no_grad():
         for d in test_dataloader:
             d = d.to(device)
             out_net = model(d)
             out_criterion = criterion(out_net, d)
+            out_net["x_hat"] = torch.clamp(out_net["x_hat"],min=0.,max=1.)
             aux_loss.update(model.aux_loss())
             bpp_loss.update(out_criterion["bpp_loss"])
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
-        
+            psnr.update(compute_psnr(out_net["x_hat"]*255.0,d*255.0))
 
         if test_writer is not None:
             step = logger.iteration
@@ -224,6 +250,7 @@ def test(iterations, test_dataloader, model, criterion,test_writer=None,logger=N
             test_writer.add_scalar("bpp_loss",bpp_loss.avg, step)
             test_writer.add_scalar("loss",loss.avg, step)
             test_writer.add_scalar("aux_loss",aux_loss.avg, step),
+            test_writer.add_scalar("psnr",psnr.avg, step),
             test_writer.add_images('gen_recon', torch.cat((out_net["x_hat"][:4],d[:4]),dim=0), step) 
     
     print(
@@ -231,7 +258,8 @@ def test(iterations, test_dataloader, model, criterion,test_writer=None,logger=N
         f"\tLoss: {loss.avg:.3f} |"
         f"\tMSE loss: {mse_loss.avg:.3f} |"
         f"\tBpp loss: {bpp_loss.avg:.2f} |"
-        f"\tAux loss: {aux_loss.avg:.2f}\n"
+        f"\tAux loss: {aux_loss.avg:.2f} |"
+        f"\tpsnr: {psnr.avg:.3f} \n"
     )
 
 
@@ -306,7 +334,7 @@ def parse_args(argv):
     parser.add_argument(
         '--test-batch-size',
         type=int,
-        default=24,
+        default=8,
         help='Test batch size (default: %(default)s)')
     parser.add_argument(
         '--quality',
@@ -355,7 +383,7 @@ def main(argv):
     args = parse_args(argv)
     
     save_dirs = prepare_save(model=args.model,dataset=args.dataname,quality=args.quality)
-    logger = Logger(log_interval=100,test_inteval=100,save_dirs=save_dirs)
+    logger = Logger(log_interval=100,test_inteval=1000,save_dirs=save_dirs)
     train_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"train"))
     test_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"test"))
     
