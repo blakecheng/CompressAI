@@ -163,7 +163,8 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
                 writer.add_scalar("mse_loss",out_criterion["mse_loss"], step)
                 writer.add_scalar("bpp_loss",out_criterion["bpp_loss"], step)
                 writer.add_scalar("loss",out_criterion["loss"], step)
-                writer.add_images('gen_recon', torch.cat((out_net["x_hat"][:4],d[:4]),dim=0), step)
+                writer.add_scalar("aux_loss",aux_loss, step),
+                
 
             
         pbar.set_description(
@@ -177,12 +178,14 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         pbar.set_postfix(iterations="{}/{}".format(logger.iteration,logger.max_iter))
 
         if logger.iteration%logger.test_inteval==1:
+            writer.add_images('gen_recon', torch.cat((out_net["x_hat"][:4],d[:4]),dim=0), step)
             loss = test(logger.iteration, test_dataloader, model, criterion,test_writer=test_writer,logger=logger)
             is_best = loss < logger.best_loss
             logger.best_loss = min(loss, logger.best_loss)
             save_checkpoint(
                 {
                     "epoch": epoch + 1,
+                    "iteration": logger.iteration,
                     "state_dict": model.state_dict(),
                     "loss": loss,
                     "optimizer": optimizer.state_dict(),
@@ -192,7 +195,6 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
                 is_best, path= logger.save_dirs["checkpoints_save"]
             )
         
-    test(logger.iteration, test_dataloader, model, criterion,test_writer=test_writer,logger=logger)
 
 
 
@@ -210,18 +212,19 @@ def test(iterations, test_dataloader, model, criterion,test_writer=None,logger=N
             d = d.to(device)
             out_net = model(d)
             out_criterion = criterion(out_net, d)
-
             aux_loss.update(model.aux_loss())
             bpp_loss.update(out_criterion["bpp_loss"])
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
+        
 
-    if test_writer is not None:
-        step = logger.iteration
-        test_writer.add_scalar("mse_loss",mse_loss.avg, step)
-        test_writer.add_scalar("bpp_loss",bpp_loss.avg, step)
-        test_writer.add_scalar("loss",loss.avg, step)
-        test_writer.add_images('gen_recon', torch.cat((out_net["x_hat"][:4],d[:4]),dim=0), step) 
+        if test_writer is not None:
+            step = logger.iteration
+            test_writer.add_scalar("mse_loss",mse_loss.avg, step)
+            test_writer.add_scalar("bpp_loss",bpp_loss.avg, step)
+            test_writer.add_scalar("loss",loss.avg, step)
+            test_writer.add_scalar("aux_loss",aux_loss.avg, step),
+            test_writer.add_images('gen_recon', torch.cat((out_net["x_hat"][:4],d[:4]),dim=0), step) 
     
     print(
         f"\niterations {iterations}: Average losses:"
@@ -303,7 +306,7 @@ def parse_args(argv):
     parser.add_argument(
         '--test-batch-size',
         type=int,
-        default=64,
+        default=24,
         help='Test batch size (default: %(default)s)')
     parser.add_argument(
         '--quality',
@@ -352,7 +355,7 @@ def main(argv):
     args = parse_args(argv)
     
     save_dirs = prepare_save(model=args.model,dataset=args.dataname,quality=args.quality)
-    logger = Logger(log_interval=100,test_inteval=1000,save_dirs=save_dirs)
+    logger = Logger(log_interval=100,test_inteval=100,save_dirs=save_dirs)
     train_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"train"))
     test_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"test"))
     
@@ -365,7 +368,7 @@ def main(argv):
     )
 
     test_transforms = transforms.Compose(
-        [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
+        [transforms.ToTensor()]
     )
 
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
@@ -377,6 +380,7 @@ def main(argv):
         num_workers=args.num_workers,
         shuffle=True,
         pin_memory=True,
+        drop_last= True
     )
 
     test_dataloader = DataLoader(

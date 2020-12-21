@@ -15,8 +15,6 @@
 from pathlib import Path
 
 from PIL import Image
-from PIL import ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 from torch.utils.data import Dataset
 import glob
 import os
@@ -56,6 +54,8 @@ class ImageFolder(Dataset):
 
         self.transform = transform
 
+        self.split = split
+
     def __getitem__(self, index):
         """
         Args:
@@ -65,31 +65,17 @@ class ImageFolder(Dataset):
             img: `PIL.Image.Image` or transformed `PIL.Image.Image`.
         """
         img = Image.open(self.samples[index]).convert("RGB")
+
+        if self.split == "test":
+            imsize = img.size
+            if imsize[0]>imsize[1]:
+                img = img.transpose(Image.ROTATE_90)
+
         if self.transform:
             return self.transform(img)
+        
         return img
 
     def __len__(self):
         return len(self.samples)
 
-def makedirs(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-
-
-def setup_generic_signature(special_info):
-    time_signature = '{:%Y_%m_%d_%H:%M}'.format(datetime.datetime.now()).replace(':', '_')
-    name = '{}_{}'.format(special_info, time_signature)
-    root = os.path.join("../experiment",name)
-    checkpoints_save = os.path.join(root,"checkpoints")
-    figures_save = os.path.join(root, 'figures')
-    tensorboard_runs = os.path.join(root, 'tensorboard')
-    
-    makedirs(checkpoints_save)
-    makedirs(figures_save)
-    makedirs(tensorboard_runs)
-
-    return {"checkpoints_save": checkpoints_save,
-        "figures_save":figures_save,
-        "tensorboard_runs": tensorboard_runs
-    }
