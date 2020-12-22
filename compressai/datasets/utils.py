@@ -19,6 +19,7 @@ from torch.utils.data import Dataset
 import glob
 import os
 import datetime
+import random
 
 class ImageFolder(Dataset):
     """Load an image folder database. Training and testing image samples
@@ -64,8 +65,18 @@ class ImageFolder(Dataset):
         Returns:
             img: `PIL.Image.Image` or transformed `PIL.Image.Image`.
         """
-        img = Image.open(self.samples[index]).convert("RGB")
-
+        try:
+            img = Image.open(self.samples[index]).convert("RGB")
+        except:
+            print("loading error:%s"%self.samples[index])
+            while true:
+                index = index = random.randint(0, len(self) - 1)
+                try:
+                    img = Image.open(self.samples[index]).convert("RGB")
+                    break
+                except:
+                    print("loading error:%s"%self.samples[index])
+                
         if self.split == "test":
             imsize = img.size
             if imsize[0]>imsize[1]:
