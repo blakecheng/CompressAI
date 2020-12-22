@@ -22,90 +22,95 @@ import torch.nn.functional as F
 # pylint: disable=E0611,E0401
 from compressai.ans import BufferedRansEncoder, RansDecoder
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
-from compressai.layers import GDN, MaskedConv2d, Scale_GDN
+from compressai.layers import GDN, MaskedConv2d
 
 from .utils import conv, deconv, update_registered_buffers
-
+from .priors import CompressionModel
 # pylint: enable=E0611,E0401
 
 
 __all__ = [
-    "CompressionModel",
-    "FactorizedPrior",
-    "ScaleHyperprior",
-    "MeanScaleHyperprior",
-    "JointAutoregressiveHierarchicalPriors",
+    "Scale_FactorizedPrior",
+    "Decoder"
 ]
 
+class SPADE(nn.Module):
+    def __init__(self,in_chan,num_filters,activation="relu"):
+        super(SPADE, self).__init__()
+        ## 3*3 spade
+        self.conv = spectral_norm(nn.Conv2d(in_chan, num_filters, kernel_size=(3, 3), padding=1))
+        self.conv_gamma = spectral_norm(nn.Conv2d(num_filters, num_filters, kernel_size=(3, 3), padding=1))
+        self.conv_beta = spectral_norm(nn.Conv2d(num_filters, num_filters, kernel_size=(3, 3), padding=1)) 
 
-class CompressionModel(nn.Module):
-    """Base class for constructing an auto-encoder with at least one entropy
-    bottleneck module.
+        ## 3*3 despade
+        # self.conv = spectral_norm(nn.ConvTranspose2d(in_chan,num_filters,kernel_size=3,stride=2,output_padding= 1, padding=1))
+        # self.conv_gamma = spectral_norm(nn.ConvTranspose2d(in_chan,num_filters,kernel_size=3,stride=2,output_padding= 1, padding=1))
+        # self.conv_beta = spectral_norm(nn.ConvTranspose2d(in_chan,num_filters,kernel_size=3,stride=2,output_padding= 1, padding=1))
 
-    Args:
-        entropy_bottleneck_channels (int): Number of channels of the entropy
-            bottleneck
-    """
+        # 1*1 spade
+        # self.conv = spectral_norm(nn.Conv2d(in_chan, num_filters, kernel_size=1, stride=1, padding=0))
+        # self.conv_gamma = spectral_norm(nn.Conv2d(num_filters, num_filters,  kernel_size=1, stride=1, padding=0))
+        # self.conv_beta = spectral_norm(nn.Conv2d(num_filters, num_filters,  kernel_size=1, stride=1, padding=0))
+        self.activation = getattr(F, activation)
 
-    def __init__(self, entropy_bottleneck_channels, init_weights=True):
+    def forward(self, x_norm, seg):
+        seg = self.activation(self.conv(seg))
+        seg_gamma = self.conv_gamma(seg)
+        seg_beta = self.conv_beta(seg)
+        x = x_norm*(1+seg_gamma) + seg_beta
+        return x
+        
+class AdaptiveDeNormalization(nn.Module):
+    def __init__(self,in_chan,num_filters,mode="spade",activation="relu"):
+        super(AdaptiveDeNormalization, self).__init__()
+        if mode == "spade":
+            self.adaptivelayer = SPADE(in_chan,num_filters,activation=activation)
+    
+    def forward(self,norm,weight):
+        return self.adaptivelayer(norm,weight)
+
+
+class Decoder(nn.Module):
+    def __init__(self,M,N,scale=3,out=3):
         super().__init__()
-        self.entropy_bottleneck = EntropyBottleneck(entropy_bottleneck_channels)
-
-        if init_weights:
-            self._initialize_weights()
-
-    def aux_loss(self):
-        """Return the aggregated loss over the auxiliary entropy bottleneck
-        module(s).
-        """
-        aux_loss = sum(
-            m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck)
+        assert (M%scale==0), "M={} can be divisible by scale={}".format(M,scale)
+        self.head =  nn.Sequential(
+            conv(M//scale, M, stride=1, kernel_size=3),
+            GDN(M,inverse=True),
+            deconv(M, N),
+            GDN(N,inverse=True)
         )
-        return aux_loss
 
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        self.blocks = nn.ModuleList([])
+        self.adaptivelayer = AdaptiveDeNormalization()
+        for _ in range(scale-1):
+            self.blocks.append(
+                nn.Sequential(
+                    deconv(N, N)),
+                    GDN(N,inverse=True)
+                )
+            )
 
-    def forward(self, *args):
-        raise NotImplementedError()
+       
+        
 
-    def parameters(self):
-        """Returns an iterator over the model parameters."""
-        for m in self.children():
-            if isinstance(m, EntropyBottleneck):
-                continue
-            for p in m.parameters():
-                yield p
+        self.tail =  deconv(N, out)
+        self.scale_size = M//scale
+        self.scale = scale
 
-    def aux_parameters(self):
-        """
-        Returns an iterator over the entropy bottleneck(s) parameters for
-        the auxiliary loss.
-        """
-        for m in self.children():
-            if not isinstance(m, EntropyBottleneck):
-                continue
-            for p in m.parameters():
-                yield p
+        
+    def forward(self,y):
+        x = y[:,:self.scale_size]
+        x = self.head(x)
+        x = self.gdn_scale(x,y[:,:self.scale_size])
+        for m in range(self.scale-1):
+            x = self.blocks[2*m](x)
+            x = self.blocks[2*m+1](x,y[:,self.scale_size*m:self.scale_size*(m+1)])
+        x = self.tail(x)
+        return x
 
-    def update(self, force=False):
-        """Updates the entropy bottleneck(s) CDF values.
-
-        Needs to be called once after training to be able to later perform the
-        evaluation with an actual entropy coder.
-
-        Args:
-            force (bool): overwrite previous values (default: False)
-
-        """
-        for m in self.children():
-            if not isinstance(m, EntropyBottleneck):
-                continue
-            m.update(force=force)
+    
+        
 
 class Scale_FactorizedPrior(CompressionModel):
     r"""Factorized Prior model from J. Balle, D. Minnen, S. Singh, S.J. Hwang,
@@ -132,15 +137,7 @@ class Scale_FactorizedPrior(CompressionModel):
             conv(N, M),
         )
 
-        self.g_s = nn.Sequential(
-            deconv(M, N),
-            Scale_GDN(N, M//3, inverse=True),
-            deconv(N, N),
-            Scale_GDN(N, M//3, inverse=True),
-            deconv(N, N),
-            Scale_GDN(N, M//3, inverse=True),
-            deconv(N, 3),
-        )
+        self.g_s = Decoder(M,N,scale=3,out=3)
 
         self.N = N
         self.M = M

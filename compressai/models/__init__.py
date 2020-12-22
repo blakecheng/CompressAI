@@ -14,3 +14,4 @@
 
 from .priors import *
 from .waseda import *
+from .scale_prior import *
