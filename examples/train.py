@@ -126,7 +126,7 @@ class Logger:
 
     def updata(self):
         self.iteration+=1
-        if self.iteration%self.log_interval==1:
+        if self.iteration%self.log_interval==0:
             return True
         return False
 
@@ -201,7 +201,8 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
         )
         pbar.set_postfix(iterations="{}/{}".format(logger.iteration,logger.max_iter))
 
-        if logger.iteration%logger.test_inteval==1:
+        if logger.iteration%logger.test_inteval==0:
+            print("\ntesting:")
             writer.add_images('gen_recon', torch.cat((out_net["x_hat"][:4],d[:4]),dim=0), step)
             loss = test(logger.iteration, test_dataloader, model, criterion,test_writer=test_writer,logger=logger)
             is_best = loss < logger.best_loss
@@ -218,6 +219,7 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
                 },
                 is_best, path= logger.save_dirs["checkpoints_save"]
             )
+            model.train()
         
 
 
@@ -334,7 +336,7 @@ def parse_args(argv):
     parser.add_argument(
         '--test-batch-size',
         type=int,
-        default=8,
+        default=4,
         help='Test batch size (default: %(default)s)')
     parser.add_argument(
         '--quality',
@@ -383,7 +385,7 @@ def main(argv):
     args = parse_args(argv)
     
     save_dirs = prepare_save(model=args.model,dataset=args.dataname,quality=args.quality)
-    logger = Logger(log_interval=100,test_inteval=1000,save_dirs=save_dirs)
+    logger = Logger(log_interval=100,test_inteval=100,save_dirs=save_dirs)
     train_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"train"))
     test_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"test"))
     
