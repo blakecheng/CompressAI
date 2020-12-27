@@ -108,6 +108,7 @@ class CompressionModel(nn.Module):
             m.update(force=force)
 
 
+
 class FactorizedPrior(CompressionModel):
     r"""Factorized Prior model from J. Balle, D. Minnen, S. Singh, S.J. Hwang,
     N. Johnston: `"Variational Image Compression with a Scale Hyperprior"
@@ -154,6 +155,18 @@ class FactorizedPrior(CompressionModel):
         y = self.g_a(x)
         y_hat, y_likelihoods = self.entropy_bottleneck(y)
         x_hat = self.g_s(y_hat)
+
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {
+                "y": y_likelihoods,
+            },
+        }
+    
+    def ae(self, x):
+        y = self.g_a(x)
+        y_hat, y_likelihoods = self.entropy_bottleneck(y)
+        x_hat = self.g_s(y)
 
         return {
             "x_hat": x_hat,
@@ -278,6 +291,19 @@ class ScaleHyperprior(CompressionModel):
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
         }
 
+    def ae(self,x):
+        y = self.g_a(x)
+        z = self.h_a(torch.abs(y))
+        z_hat, z_likelihoods = self.entropy_bottleneck(z)
+        scales_hat = self.h_s(z_hat)
+        y_hat, y_likelihoods = self.gaussian_conditional(y, scales_hat)
+        x_hat = self.g_s(y)
+
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+        }
+
     def load_state_dict(self, state_dict):
         # Dynamically update the entropy bottleneck buffers related to the CDFs
         update_registered_buffers(
@@ -370,6 +396,20 @@ class MeanScaleHyperprior(ScaleHyperprior):
         scales_hat, means_hat = gaussian_params.chunk(2, 1)
         y_hat, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
         x_hat = self.g_s(y_hat)
+
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+        }
+    
+    def ae(self, x):
+        y = self.g_a(x)
+        z = self.h_a(y)
+        z_hat, z_likelihoods = self.entropy_bottleneck(z)
+        gaussian_params = self.h_s(z_hat)
+        scales_hat, means_hat = gaussian_params.chunk(2, 1)
+        y_hat, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
+        x_hat = self.g_s(y)
 
         return {
             "x_hat": x_hat,
@@ -489,6 +529,28 @@ class JointAutoregressiveHierarchicalPriors(CompressionModel):
         scales_hat, means_hat = gaussian_params.chunk(2, 1)
         _, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
         x_hat = self.g_s(y_hat)
+
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+        }
+
+    def ae(self, x):
+        y = self.g_a(x)
+        z = self.h_a(y)
+        z_hat, z_likelihoods = self.entropy_bottleneck(z)
+        params = self.h_s(z_hat)
+
+        y_hat = self.gaussian_conditional.quantize(
+            y, "noise" if self.training else "dequantize"
+        )
+        ctx_params = self.context_prediction(y_hat)
+        gaussian_params = self.entropy_parameters(
+            torch.cat((params, ctx_params), dim=1)
+        )
+        scales_hat, means_hat = gaussian_params.chunk(2, 1)
+        _, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
+        x_hat = self.g_s(y)
 
         return {
             "x_hat": x_hat,

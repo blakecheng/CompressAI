@@ -86,7 +86,7 @@ class Decoder(nn.Module):
         for _ in range(scale-1):
             self.blocks.append(
                 nn.Sequential(
-                    deconv(N, N)),
+                    deconv(N, N),
                     GDN(N,inverse=True)
                 )
             )
