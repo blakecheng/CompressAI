@@ -99,6 +99,36 @@ class RateDistortionLoss(nn.Module):
 
         return out
 
+class WeightedRateDistortionLoss(nn.Module):
+    """Custom rate distortion loss with a Lagrangian parameter."""
+
+    def __init__(self, lmbda=1e-2,scale=8):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.lmbda = lmbda
+        self.scale = scale
+        self.weight = [2*i for i in range(scale)]
+
+    def forward(self, output, target):
+        N, _, H, W = target.size()
+        out = {}
+        num_pixels = N * H * W
+
+        out["bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"].values()
+        )
+
+        
+        out["mse_loss"] = sum(
+            (self.weight[i]*self.mse(output["rgb_list"][i],target))
+            for i in range(len(output["rgb_list"]))
+        )
+        # out["mse_loss"] = self.mse(output["x_hat"], target)
+        out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
+
+        return out
+
 class InformationDistillationRateDistortionLoss(nn.Module):
     def __init__(self,lmbda=1e-2):
         super().__init__()
@@ -536,6 +566,8 @@ def main(argv):
         criterion = RateDistortionLoss(lmbda=args.lmbda)
     elif args.loss == "ID":
         criterion = InformationDistillationRateDistortionLoss(lmbda=args.lmbda)
+    elif args.loss == "weight":
+        criterion = WeightedRateDistortionLoss(lmbda=args.lmbda,scale=args.scale)
 
     best_loss = 1e10
     if cmd_args.resume == True:
