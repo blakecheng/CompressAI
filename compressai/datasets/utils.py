@@ -69,7 +69,7 @@ class ImageFolder(Dataset):
             img = Image.open(self.samples[index]).convert("RGB")
         except:
             print("loading error:%s"%self.samples[index])
-            while true:
+            while True:
                 index = index = random.randint(0, len(self) - 1)
                 try:
                     img = Image.open(self.samples[index]).convert("RGB")

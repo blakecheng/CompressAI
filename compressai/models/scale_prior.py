@@ -26,26 +26,30 @@ from compressai.layers import GDN, MaskedConv2d
 
 from .utils import conv, deconv, update_registered_buffers
 from .priors import CompressionModel
+from torch.nn.utils import spectral_norm
+import copy
 # pylint: enable=E0611,E0401
 
 
 __all__ = [
     "Scale_FactorizedPrior",
-    "Decoder"
+    "Decoder",
+    "MultiScale_FactorizedPrior"
 ]
 
 class SPADE(nn.Module):
     def __init__(self,in_chan,num_filters,activation="relu"):
         super(SPADE, self).__init__()
         ## 3*3 spade
-        self.conv = spectral_norm(nn.Conv2d(in_chan, num_filters, kernel_size=(3, 3), padding=1))
-        self.conv_gamma = spectral_norm(nn.Conv2d(num_filters, num_filters, kernel_size=(3, 3), padding=1))
-        self.conv_beta = spectral_norm(nn.Conv2d(num_filters, num_filters, kernel_size=(3, 3), padding=1)) 
+        # self.conv = spectral_norm(nn.Conv2d(in_chan, num_filters, kernel_size=(3, 3), padding=1))
+        # self.conv_gamma = spectral_norm(nn.Conv2d(num_filters, num_filters, kernel_size=(3, 3), padding=1))
+        # self.conv_beta = spectral_norm(nn.Conv2d(num_filters, num_filters, kernel_size=(3, 3), padding=1)) 
 
         ## 3*3 despade
-        # self.conv = spectral_norm(nn.ConvTranspose2d(in_chan,num_filters,kernel_size=3,stride=2,output_padding= 1, padding=1))
-        # self.conv_gamma = spectral_norm(nn.ConvTranspose2d(in_chan,num_filters,kernel_size=3,stride=2,output_padding= 1, padding=1))
-        # self.conv_beta = spectral_norm(nn.ConvTranspose2d(in_chan,num_filters,kernel_size=3,stride=2,output_padding= 1, padding=1))
+        self.conv = spectral_norm(nn.ConvTranspose2d(in_chan,num_filters,kernel_size=3,stride=2,output_padding= 1, padding=1))
+        self.conv_gamma = spectral_norm(nn.Conv2d(num_filters, num_filters, kernel_size=(3, 3), padding=1))
+        self.conv_beta = spectral_norm(nn.Conv2d(num_filters, num_filters, kernel_size=(3, 3), padding=1))
+
 
         # 1*1 spade
         # self.conv = spectral_norm(nn.Conv2d(in_chan, num_filters, kernel_size=1, stride=1, padding=0))
@@ -58,8 +62,13 @@ class SPADE(nn.Module):
         seg_gamma = self.conv_gamma(seg)
         seg_beta = self.conv_beta(seg)
         x = x_norm*(1+seg_gamma) + seg_beta
-        return x
         
+        return x
+
+
+        
+
+
 class AdaptiveDeNormalization(nn.Module):
     def __init__(self,in_chan,num_filters,mode="spade",activation="relu"):
         super(AdaptiveDeNormalization, self).__init__()
@@ -69,32 +78,64 @@ class AdaptiveDeNormalization(nn.Module):
     def forward(self,norm,weight):
         return self.adaptivelayer(norm,weight)
 
+class ScaleableResidualBlock(nn.Module):
+    def __init__(self, in_channels, scale_channel, kernel_size=3, stride=1, activation='relu',mode="spade"):
+        super(ScaleableResidualBlock, self).__init__()
+        self.activation = getattr(F, activation)
+        pad_size = int((kernel_size-1)/2)
+        self.pad = nn.ReflectionPad2d(pad_size)
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride)
+        self.norm1 = GDN(in_channels, inverse=True)
+        self.norm2 = GDN(in_channels, inverse=True)
+        self.adaptivelayer1 = AdaptiveDeNormalization(in_chan=scale_channel,num_filters=in_channels,mode=mode,activation=activation)
+        self.adaptivelayer2 = AdaptiveDeNormalization(in_chan=scale_channel,num_filters=in_channels,mode=mode,activation=activation)
+
+    def forward(self, x, style):
+        identity_map = x
+        res = self.pad(x)
+        res = self.conv1(res)
+        res = self.norm1(res)
+        res = self.adaptivelayer1(res,style)
+
+        res = self.activation(res)
+        res = self.pad(res)
+        res = self.conv2(res)
+        res = self.norm2(res)
+        res = self.adaptivelayer2(res,style)
+
+        return torch.add(res, identity_map)
+        
 
 class Decoder(nn.Module):
-    def __init__(self,M,N,scale=3,out=3):
+    def __init__(self,M,N,scale=3,out=3,share_rgb=True):
         super().__init__()
         assert (M%scale==0), "M={} can be divisible by scale={}".format(M,scale)
         self.head =  nn.Sequential(
-            conv(M//scale, M, stride=1, kernel_size=3),
-            GDN(M,inverse=True),
-            deconv(M, N),
+            conv(M//scale, N, stride=1, kernel_size=3),
+            GDN(N,inverse=True),
+            deconv(N, N),
             GDN(N,inverse=True)
         )
 
         self.blocks = nn.ModuleList([])
-        self.adaptivelayer = AdaptiveDeNormalization()
-        for _ in range(scale-1):
-            self.blocks.append(
-                nn.Sequential(
+
+        to_rgb =  nn.Sequential(
                     deconv(N, N),
-                    GDN(N,inverse=True)
+                    GDN(N,inverse=True),
+                    deconv(N, N),
+                    GDN(N,inverse=True),
+                    deconv(N, 3)
                 )
-            )
 
-       
-        
+        for m in range(scale):
+            resblock_m = ScaleableResidualBlock(in_channels=N,scale_channel=M//scale,activation='relu',mode="spade")
+            self.add_module(f'resblock_{str(m)}', resblock_m)
+            if share_rgb==False:
+                self.add_module(f'to_rgb_{str(m)}', copy.deepcopy(to_rgb))
+            else:
+                self.add_module(f'to_rgb_{str(m)}', copy.copy(to_rgb))
 
-        self.tail =  deconv(N, out)
         self.scale_size = M//scale
         self.scale = scale
 
@@ -102,15 +143,18 @@ class Decoder(nn.Module):
     def forward(self,y):
         x = y[:,:self.scale_size]
         x = self.head(x)
-        x = self.gdn_scale(x,y[:,:self.scale_size])
-        for m in range(self.scale-1):
-            x = self.blocks[2*m](x)
-            x = self.blocks[2*m+1](x,y[:,self.scale_size*m:self.scale_size*(m+1)])
-        x = self.tail(x)
-        return x
+        rgb_list = []
+        for m in range(self.scale):
+            resblock_m = getattr(self, f'resblock_{str(m)}')
+            to_rgb = getattr(self, f'to_rgb_{str(m)}')
+            x = resblock_m(x,y[:,self.scale_size*m:self.scale_size*(m+1)])
+            rgb = to_rgb(x)
+            rgb_list.append(rgb)
 
-    
-        
+        return rgb_list
+
+
+
 
 class Scale_FactorizedPrior(CompressionModel):
     r"""Factorized Prior model from J. Balle, D. Minnen, S. Singh, S.J. Hwang,
@@ -124,8 +168,8 @@ class Scale_FactorizedPrior(CompressionModel):
             encoder and last layer of the hyperprior decoder)
     """
 
-    def __init__(self, N, M, **kwargs):
-        super().__init__(entropy_bottleneck_channels=M, **kwargs)
+    def __init__(self, N, M,scale,**kwargs):
+        super().__init__(entropy_bottleneck_channels=M//scale, **kwargs)
 
         self.g_a = nn.Sequential(
             conv(3, N),
@@ -137,10 +181,12 @@ class Scale_FactorizedPrior(CompressionModel):
             conv(N, M),
         )
 
-        self.g_s = Decoder(M,N,scale=3,out=3)
+        self.g_s = Decoder(M,N,scale=scale,out=3)
 
         self.N = N
         self.M = M
+        self.scale = scale
+        self.scale_size = M//scale
 
     @property
     def downsampling_factor(self) -> int:
@@ -148,14 +194,25 @@ class Scale_FactorizedPrior(CompressionModel):
 
     def forward(self, x):
         y = self.g_a(x)
-        y_hat, y_likelihoods = self.entropy_bottleneck(y)
-        x_hat = self.g_s(y_hat)
+        y_hat_list = []
+        y_likelihoods_list = []
+        for m in range(self.scale):
+            y_scale= y[:,self.scale_size*m:self.scale_size*(m+1)]
+            y_hat_scale, y_likelihoods_scale = self.entropy_bottleneck(y_scale)
+            y_hat_list.append(y_hat_scale)
+            y_likelihoods_list.append(y_likelihoods_scale)
+        y_hat=torch.cat(y_hat_list, dim=1)
+        y_likelihoods = torch.cat(y_likelihoods_list,dim=1)
 
+        rgb_list = self.g_s(y_hat)
+        x_hat = torch.mean(torch.stack(rgb_list), 0) 
         return {
             "x_hat": x_hat,
             "likelihoods": {
                 "y": y_likelihoods,
             },
+            "rgb_list": rgb_list,
+            "y_likelihoods_list":y_likelihoods_list
         }
 
     def load_state_dict(self, state_dict):
@@ -188,6 +245,120 @@ class Scale_FactorizedPrior(CompressionModel):
         x_hat = self.g_s(y_hat)
         return {"x_hat": x_hat}
 
+
+class MultiScale_Decoder(nn.Module):
+    def __init__(self,M,N,scale=3,out=3,share_rgb=True):
+        super().__init__()
+        self.head =  nn.Sequential(
+            conv(M, N, stride=1, kernel_size=3),
+            GDN(N,inverse=True),
+            deconv(N, N),
+            GDN(N,inverse=True)
+        )
+
+        self.blocks = nn.ModuleList([])
+
+        to_rgb =  nn.Sequential(
+                    deconv(N, N),
+                    GDN(N,inverse=True),
+                    deconv(N, N),
+                    GDN(N,inverse=True),
+                    deconv(N, 3)
+                )
+
+        for m in range(scale):
+            resblock_m = ScaleableResidualBlock(in_channels=N,scale_channel=M,activation='relu',mode="spade")
+            self.add_module(f'resblock_{str(m)}', resblock_m)
+            if share_rgb==False:
+                self.add_module(f'to_rgb_{str(m)}', copy.deepcopy(to_rgb))
+            else:
+                self.add_module(f'to_rgb_{str(m)}', copy.copy(to_rgb))
+
+        self.scale = scale
+
+        
+    def forward(self,y):
+        x = y
+        x = self.head(x)
+        rgb_list = []
+        for m in range(self.scale):
+            resblock_m = getattr(self, f'resblock_{str(m)}')
+            to_rgb = getattr(self, f'to_rgb_{str(m)}')
+            x = resblock_m(x,y)
+            rgb = to_rgb(x)
+            rgb_list.append(rgb)
+
+        return rgb_list
+
+
+class MultiScale_FactorizedPrior(CompressionModel):
+    def __init__(self, N, M,scale,**kwargs):
+        super().__init__(entropy_bottleneck_channels=M, **kwargs)
+
+        self.g_a = nn.Sequential(
+            conv(3, N),
+            GDN(N),
+            conv(N, N),
+            GDN(N),
+            conv(N, N),
+            GDN(N),
+            conv(N, M),
+        )
+
+        self.g_s = MultiScale_Decoder(M,N,scale=scale,out=3)
+
+        self.N = N
+        self.M = M
+        self.scale = scale
+        self.scale_size = M//scale
+
+    @property
+    def downsampling_factor(self) -> int:
+        return 2 ** 4
+
+    def forward(self, x):
+        y = self.g_a(x)
+        y_hat, y_likelihoods = self.entropy_bottleneck(y)
+
+        rgb_list = self.g_s(y_hat)
+        x_hat = rgb_list[-1]
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {
+                "y": y_likelihoods,
+            },
+            "rgb_list": rgb_list
+        }
+
+    def load_state_dict(self, state_dict):
+        # Dynamically update the entropy bottleneck buffers related to the CDFs
+        update_registered_buffers(
+            self.entropy_bottleneck,
+            "entropy_bottleneck",
+            ["_quantized_cdf", "_offset", "_cdf_length"],
+            state_dict,
+        )
+        super().load_state_dict(state_dict)
+
+    @classmethod
+    def from_state_dict(cls, state_dict):
+        """Return a new model instance from `state_dict`."""
+        N = state_dict["g_a.0.weight"].size(0)
+        M = state_dict["g_a.6.weight"].size(0)
+        net = cls(N, M)
+        net.load_state_dict(state_dict)
+        return net
+
+    def compress(self, x):
+        y = self.g_a(x)
+        y_strings = self.entropy_bottleneck.compress(y)
+        return {"strings": [y_strings], "shape": y.size()[-2:]}
+
+    def decompress(self, strings, shape):
+        assert isinstance(strings, list) and len(strings) == 1
+        y_hat = self.entropy_bottleneck.decompress(strings[0], shape)
+        x_hat = self.g_s(y_hat)
+        return {"x_hat": x_hat}
 
 # From Balle's tensorflow compression examples
 SCALES_MIN = 0.11

@@ -20,7 +20,7 @@ from compressai.models import (
     FactorizedPrior,
     JointAutoregressiveHierarchicalPriors,
     MeanScaleHyperprior,
-    ScaleHyperprior,
+    ScaleHyperprior
 )
 
 __all__ = [
@@ -235,6 +235,7 @@ def bmshj2018_factorized(
     return _load_model(
         "bmshj2018-factorized", metric, quality, pretrained, progress, **kwargs
     )
+
 
 
 def bmshj2018_hyperprior(

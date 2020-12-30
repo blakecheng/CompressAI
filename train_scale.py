@@ -36,6 +36,8 @@ from compressai.zoo import (bmshj2018_factorized, bmshj2018_hyperprior, mbt2018_
 from tqdm import tqdm 
 import os
 import logging
+from compressai.models import Scale_FactorizedPrior
+import getopt
 
 
 class AutoEncoder(CompressionModel):
@@ -96,6 +98,28 @@ class RateDistortionLoss(nn.Module):
         out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
 
         return out
+
+class InformationDistillationRateDistortionLoss(nn.Module):
+    def __init__(self,lmbda=1e-2):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.lmbda = lmbda
+    
+    def forward(self,output,target):
+        N, _, H, W = target.size()
+        out = {}
+        num_pixels = N * H * W
+        out["bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"].values()
+        )
+        out["mse_loss"] = 0
+        for st,te in zip(output["rgb_list"],output["rgb_list"][1:]+[target]):
+            out["mse_loss"] += self.mse(st, te)
+        out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
+        return out
+        
+
 
 
 class AverageMeter:
@@ -201,6 +225,7 @@ def train_one_epoch(model, criterion, train_dataloader, optimizer, aux_optimizer
 
         if logger.iteration%logger.test_inteval==0:
             print("\ntesting:")
+            step = logger.iteration
             writer.add_images('gen_recon', torch.cat((out_net["x_hat"][:4],d[:4]),dim=0), step)
             loss = test(logger.iteration, test_dataloader, model, criterion,test_writer=test_writer,logger=logger)
             is_best = loss < logger.best_loss
@@ -230,7 +255,9 @@ def test(iterations, test_dataloader, model, criterion,test_writer=None,logger=N
     bpp_loss = AverageMeter()
     mse_loss = AverageMeter()
     aux_loss = AverageMeter()
-    psnr = AverageMeter()
+    psnr_list = []
+    for i in range(model.scale):
+        psnr_list.append(AverageMeter())
 
     with torch.no_grad():
         for d in test_dataloader:
@@ -242,15 +269,19 @@ def test(iterations, test_dataloader, model, criterion,test_writer=None,logger=N
             bpp_loss.update(out_criterion["bpp_loss"])
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
-            psnr.update(compute_psnr(out_net["x_hat"]*255.0,d*255.0))
+            for i,rgb in enumerate(out_net["rgb_list"]):
+                psnr_list[i].update(compute_psnr(rgb*255.0,d*255.0))
 
         if test_writer is not None:
             step = logger.iteration
             test_writer.add_scalar("mse_loss",mse_loss.avg, step)
             test_writer.add_scalar("bpp_loss",bpp_loss.avg, step)
             test_writer.add_scalar("loss",loss.avg, step)
-            test_writer.add_scalar("aux_loss",aux_loss.avg, step),
-            test_writer.add_scalar("psnr",psnr.avg, step),
+            test_writer.add_scalar("aux_loss",aux_loss.avg, step)
+            for i,psnr in enumerate(psnr_list):
+                test_writer.add_scalar(f"psnr_{i}",psnr.avg, step)
+            last_index = len(psnr_list)-1
+            test_writer.add_scalar(f"psnr_{last_index}",psnr_list[last_index].avg, step)
             test_writer.add_images('gen_recon', torch.cat((out_net["x_hat"][:4],d[:4]),dim=0), step) 
     
     print(
@@ -259,9 +290,12 @@ def test(iterations, test_dataloader, model, criterion,test_writer=None,logger=N
         f"\tMSE loss: {mse_loss.avg:.3f} |"
         f"\tBpp loss: {bpp_loss.avg:.2f} |"
         f"\tAux loss: {aux_loss.avg:.2f} |"
-        f"\tpsnr: {psnr.avg:.3f} \n"
+        f"\tpsnr:",
+        f",".join(f"{psnr.avg:.2f}" for psnr in psnr_list)
     )
 
+    if logger.iteration>logger.max_iter:
+        exit
 
     return loss.avg
 
@@ -269,11 +303,11 @@ def test(iterations, test_dataloader, model, criterion,test_writer=None,logger=N
 def save_checkpoint(state, is_best, path):
     filename=os.path.join(path,"checkpoint.pth.tar")
     torch.save(state, filename)
-    print("save to:",filename)
+    print("save to:%s\n"%filename)
     if is_best:
         shutil.copyfile(filename, os.path.join(path,"checkpoint_best_loss.pth.tar"))
 
-def prepare_save(model="defualt",dataset="openimage",quality=1,ckpt=None):
+def prepare_save(model="defualt",dataset="openimage",quality=1,ckpt=None,args=None):
     if ckpt is not None:
         root = os.path.split(os.path.split(ckpt)[0])[0]
         checkpoints_save = os.path.join(root,"checkpoints")
@@ -284,7 +318,18 @@ def prepare_save(model="defualt",dataset="openimage",quality=1,ckpt=None):
         "tensorboard_runs": tensorboard_runs
     }
     else:
+        argv=sys.argv[1:]
         special_info = "{}_{}_q{}".format(model,dataset,quality)
+        for opt in argv:
+            if opt in "--scale":
+                special_info = special_info+"_s%s"%(args.scale)
+            if opt in "--loss":
+                special_info = special_info+"_l%s"%(args.loss)
+            if opt in "--lambda":
+                special_info = special_info+"_%s"%(args.lmbda)
+            # if opt in "--lambda":
+            #     special_info = special_info+"_l%s"%(args.lambda)
+                # special_info = special_info+"_lmd%f"%(args.lambda)
         save_dirs = setup_generic_signature(special_info)
     return save_dirs
 
@@ -374,6 +419,24 @@ def parse_args(argv):
         type=float,
         help='Set random seed for reproducibility')
     parser.add_argument(
+        '--loss',
+        type=str,
+        default = "avg",
+        help='loss type'
+    )
+    parser.add_argument(
+        '--scale',
+        type=int,
+        default = 8,
+        help='scale'
+    )
+    parser.add_argument(
+        '--adaptive',
+        type=str,
+        default="spade",
+        help='adaptive type'
+    )
+    parser.add_argument(
         '--resume',
         type=bool,
         default=False,
@@ -382,6 +445,8 @@ def parse_args(argv):
         '--ckpt',
         type=str,
         help='ckpt path')
+    
+    
     parser.add_argument('--clip_max_norm',
                         default=0.1,
                         type=float,
@@ -408,9 +473,9 @@ def main(argv):
         save_dirs = prepare_save(model=args.model,dataset=args.dataname,quality=args.quality,ckpt=cmd_args.ckpt)
     else:
         args = cmd_args
-        save_dirs = prepare_save(model=args.model,dataset=args.dataname,quality=args.quality)
-    
-    logger = Logger(log_interval=100,test_inteval=100,save_dirs=save_dirs)
+        save_dirs = prepare_save(model=args.model,dataset=args.dataname,quality=args.quality,args=args)
+
+    logger = Logger(log_interval=100,test_inteval=100,save_dirs=save_dirs,max_iter=args.iterations)
     train_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"train"))
     test_writer = SummaryWriter(os.path.join(save_dirs["tensorboard_runs"],"test"))
     
@@ -450,8 +515,8 @@ def main(argv):
 
     if args.model == "AE":
         net = AutoEncoder()
-    elif  args.model == "bmshj2018_factorized":
-        net = bmshj2018_factorized(quality=args.quality)
+    elif  args.model == "scale_bmshj2018_factorized":
+        net = Scale_FactorizedPrior(N= 192, M=320,scale=args.scale)
     elif  args.model == "bmshj2018_hyperprior":
         net = bmshj2018_hyperprior(quality=args.quality)
     elif  args.model == "mbt2018_mean":
@@ -465,10 +530,12 @@ def main(argv):
     net = net.to(device)
     optimizer = optim.Adam(net.parameters(), lr=args.learning_rate)
     aux_optimizer = optim.Adam(net.aux_parameters(), lr=args.aux_learning_rate)
-    criterion = RateDistortionLoss(lmbda=args.lmbda)
+    if args.loss == "avg":
+        criterion = RateDistortionLoss(lmbda=args.lmbda)
+    elif args.loss == "ID":
+        criterion = InformationDistillationRateDistortionLoss(lmbda=args.lmbda)
 
     best_loss = 1e10
-
     if cmd_args.resume == True:
         logger.iteration = ckpt["iteration"]
         best_loss = ckpt["loss"]
@@ -477,7 +544,8 @@ def main(argv):
         aux_optimizer.load_state_dict(ckpt["aux_optimizer"])
         start_epoch = ckpt["epoch"]
     else:
-        start_epoch = 0   
+        start_epoch = 0
+
 
     for epoch in range(start_epoch,args.epochs):
         train_one_epoch(
