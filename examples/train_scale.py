@@ -36,7 +36,7 @@ from compressai.zoo import (bmshj2018_factorized, bmshj2018_hyperprior, mbt2018_
 from tqdm import tqdm 
 import os
 import logging
-from compressai.models import Scale_FactorizedPrior,MultiScale_FactorizedPrior
+from compressai.models import Scale_FactorizedPrior,MultiScale_FactorizedPrior,MultiEB_Scale_FactorizedPrior
 import getopt
 
 
@@ -557,6 +557,8 @@ def main(argv):
         net = cheng2020_anchor(quality=args.quality)
     elif args.model == "MultiScale_FactorizedPrior":
         net = MultiScale_FactorizedPrior(N= 192, M=320,scale=args.scale)
+    elif args.model == "MultiEB_Scale_FactorizedPrior":
+        net = MultiEB_Scale_FactorizedPrior(N= 192, M=320,scale=args.scale)
 
     
     net = net.to(device)

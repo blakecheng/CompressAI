@@ -34,7 +34,8 @@ import copy
 __all__ = [
     "Scale_FactorizedPrior",
     "Decoder",
-    "MultiScale_FactorizedPrior"
+    "MultiScale_FactorizedPrior",
+    "MultiEB_Scale_FactorizedPrior"
 ]
 
 class SPADE(nn.Module):
@@ -154,8 +155,6 @@ class Decoder(nn.Module):
         return rgb_list
 
 
-
-
 class Scale_FactorizedPrior(CompressionModel):
     r"""Factorized Prior model from J. Balle, D. Minnen, S. Singh, S.J. Hwang,
     N. Johnston: `"Variational Image Compression with a Scale Hyperprior"
@@ -223,6 +222,170 @@ class Scale_FactorizedPrior(CompressionModel):
             ["_quantized_cdf", "_offset", "_cdf_length"],
             state_dict,
         )
+        super().load_state_dict(state_dict)
+
+    @classmethod
+    def from_state_dict(cls, state_dict):
+        """Return a new model instance from `state_dict`."""
+        N = state_dict["g_a.0.weight"].size(0)
+        M = state_dict["g_a.6.weight"].size(0)
+        net = cls(N, M)
+        net.load_state_dict(state_dict)
+        return net
+
+    def compress(self, x):
+        y = self.g_a(x)
+        y_strings = self.entropy_bottleneck.compress(y)
+        return {"strings": [y_strings], "shape": y.size()[-2:]}
+
+    def decompress(self, strings, shape):
+        assert isinstance(strings, list) and len(strings) == 1
+        y_hat = self.entropy_bottleneck.decompress(strings[0], shape)
+        x_hat = self.g_s(y_hat)
+        return {"x_hat": x_hat}
+
+
+class MultiEBCompressionModel(nn.Module):
+    """Base class for constructing an auto-encoder with at least one entropy
+    bottleneck module.
+
+    Args:
+        entropy_bottleneck_channels (int): Number of channels of the entropy
+            bottleneck
+    """
+
+    def __init__(self, entropy_bottleneck_channels, scale=8,init_weights=True):
+        super().__init__()
+        for m in range(scale):
+            self.add_module(f'entropy_bottleneck_{str(m)}', EntropyBottleneck(entropy_bottleneck_channels))
+
+        if init_weights:
+            self._initialize_weights()
+
+    def aux_loss(self):
+        """Return the aggregated loss over the auxiliary entropy bottleneck
+        module(s).
+        """
+        aux_loss = sum(
+            m.loss() for m in self.modules() if isinstance(m, EntropyBottleneck)
+        )
+        return aux_loss
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, *args):
+        raise NotImplementedError()
+
+    def parameters(self):
+        """Returns an iterator over the model parameters."""
+        for m in self.children():
+            if isinstance(m, EntropyBottleneck):
+                continue
+            for p in m.parameters():
+                yield p
+
+    def aux_parameters(self):
+        """
+        Returns an iterator over the entropy bottleneck(s) parameters for
+        the auxiliary loss.
+        """
+        for m in self.children():
+            if not isinstance(m, EntropyBottleneck):
+                continue
+            for p in m.parameters():
+                yield p
+
+    def update(self, force=False):
+        """Updates the entropy bottleneck(s) CDF values.
+
+        Needs to be called once after training to be able to later perform the
+        evaluation with an actual entropy coder.
+
+        Args:
+            force (bool): overwrite previous values (default: False)
+
+        """
+        for m in self.children():
+            if not isinstance(m, EntropyBottleneck):
+                continue
+            m.update(force=force)
+
+
+class MultiEB_Scale_FactorizedPrior(MultiEBCompressionModel):
+    r"""Factorized Prior model from J. Balle, D. Minnen, S. Singh, S.J. Hwang,
+    N. Johnston: `"Variational Image Compression with a Scale Hyperprior"
+    <https://arxiv.org/abs/1802.01436>`_, Int Conf. on Learning Representations
+    (ICLR), 2018.
+
+    Args:
+        N (int): Number of channels
+        M (int): Number of channels in the expansion layers (last layer of the
+            encoder and last layer of the hyperprior decoder)
+    """
+
+    def __init__(self, N, M,scale,**kwargs):
+        super().__init__(entropy_bottleneck_channels=M//scale,scale=scale,**kwargs)
+
+        self.g_a = nn.Sequential(
+            conv(3, N),
+            GDN(N),
+            conv(N, N),
+            GDN(N),
+            conv(N, N),
+            GDN(N),
+            conv(N, M),
+        )
+
+        self.g_s = Decoder(M,N,scale=scale,out=3)
+
+        self.N = N
+        self.M = M
+        self.scale = scale
+        self.scale_size = M//scale
+
+    @property
+    def downsampling_factor(self) -> int:
+        return 2 ** 4
+
+    def forward(self, x):
+        y = self.g_a(x)
+        y_hat_list = []
+        y_likelihoods_list = []
+        for m in range(self.scale):
+            y_scale= y[:,self.scale_size*m:self.scale_size*(m+1)]
+            entropy_bottleneck = getattr(self, f'entropy_bottleneck_{str(m)}')
+            y_hat_scale, y_likelihoods_scale = entropy_bottleneck(y_scale)
+            y_hat_list.append(y_hat_scale)
+            y_likelihoods_list.append(y_likelihoods_scale)
+        y_hat=torch.cat(y_hat_list, dim=1)
+        y_likelihoods = torch.cat(y_likelihoods_list,dim=1)
+
+        rgb_list = self.g_s(y_hat)
+        x_hat = torch.mean(torch.stack(rgb_list), 0) 
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {
+                "y": y_likelihoods,
+            },
+            "rgb_list": rgb_list,
+            "y_likelihoods_list":y_likelihoods_list
+        }
+
+    def load_state_dict(self, state_dict):
+        # Dynamically update the entropy bottleneck buffers related to the CDFs
+        for m in range(self.scale):
+            entropy_bottleneck = getattr(self, f'entropy_bottleneck_{str(m)}')
+            update_registered_buffers(
+                entropy_bottleneck,
+                f'entropy_bottleneck_{str(m)}',
+                ["_quantized_cdf", "_offset", "_cdf_length"],
+                state_dict,
+            )
         super().load_state_dict(state_dict)
 
     @classmethod
